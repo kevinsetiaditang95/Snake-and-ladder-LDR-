@@ -1,17 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GameMode, GameStatus, Player, ActiveTodState, GameLogEntry, TodCard, TodType, LADDERS, SNAKES, PLAYER_PRESETS, RoomState, drawUniqueTodCard } from '../types/game';
 import { soundFX, fireVictoryConfetti, fireDareCelebrationConfetti, fireTruthSparkleConfetti } from '../utils/sound';
-
-function createLocalLog(playerName: string, playerColor: string, message: string, type: GameLogEntry['type']): GameLogEntry {
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    timestamp: new Date().toTimeString().slice(0, 5),
-    playerName,
-    playerColor,
-    message,
-    type,
-  };
-}
+import { OnlineRoomClient } from '../utils/onlineRoomEngine';
+import { createLog } from '../utils/roomStateMachine';
 
 export function useGameController() {
   const [gameMode, setGameMode] = useState<GameMode>('LOCAL');
@@ -40,7 +31,7 @@ export function useGameController() {
   const [activeRoomCode, setActiveRoomCode] = useState('');
   const [onlineError, setOnlineError] = useState('');
   const [copiedRoom, setCopiedRoom] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
+  const roomClientRef = useRef<OnlineRoomClient | null>(null);
 
   const applyServerRoomState = (room: RoomState) => {
     setStatus(room.status);
@@ -52,6 +43,7 @@ export function useGameController() {
     setWinner(room.winner);
     setLogs(room.logs);
     setCustomCards(room.customCards || []);
+    if (room.roomId) setActiveRoomCode(room.roomId);
 
     const latestLog = room.logs?.[0];
     if (latestLog && latestLog.id !== lastOnlineLogIdRef.current) {
@@ -78,89 +70,21 @@ export function useGameController() {
     }
   };
 
-  // Optional WebSocket connection + Auto-Reconnect
   useEffect(() => {
-    let isMounted = true;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const connectWs = () => {
-      if (!isMounted) return;
-      try {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-        wsRef.current = ws;
-
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            if (data.type === 'room:error') setOnlineError(data.message);
-            if (data.type === 'room:joined') {
-              setOnlineError('');
-              setActiveRoomCode(data.roomId);
-              setGameMode('ONLINE');
-              applyServerRoomState(data.state);
-            }
-            if (data.type === 'room:state') applyServerRoomState(data.state);
-          } catch (e) {
-            console.error('WS parse error:', e);
-          }
-        };
-
-        ws.onclose = () => {
-          if (isMounted) reconnectTimer = setTimeout(connectWs, 2500);
-        };
-      } catch {
-        if (isMounted) reconnectTimer = setTimeout(connectWs, 3000);
-      }
-    };
-
-    connectWs();
-    return () => {
-      isMounted = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      wsRef.current?.close();
-    };
+    const client = new OnlineRoomClient((updatedRoom) => {
+      applyServerRoomState(updatedRoom);
+    });
+    roomClientRef.current = client;
+    return () => client.destroy();
   }, []);
 
-  // Reliable HTTP polling fallback when inside an active ONLINE room
   useEffect(() => {
     if (gameMode !== 'ONLINE' || !activeRoomCode || status === 'TITLE_MENU') return;
-    const poll = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/room/${activeRoomCode}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.ok && data.state) applyServerRoomState(data.state);
-        }
-      } catch {
-        // Ignore transient network errors during poll
-      }
+    const poll = setInterval(() => {
+      roomClientRef.current?.pollSync();
     }, 1000);
     return () => clearInterval(poll);
   }, [gameMode, activeRoomCode, status]);
-
-  const sendOnlineAction = async (payload: Record<string, any>) => {
-    try {
-      const res = await fetch('/api/room', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...payload, roomId: payload.roomId || activeRoomCode, playerId: myPlayerId }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setOnlineError(data.message || 'Gagal memproses permintaan room online.');
-        return;
-      }
-      setOnlineError('');
-      if (data.roomId) setActiveRoomCode(data.roomId);
-      if (data.state) {
-        setGameMode('ONLINE');
-        applyServerRoomState(data.state);
-      }
-    } catch {
-      setOnlineError('Gagal menghubungi server. Periksa koneksi internetmu.');
-    }
-  };
 
   const handleStartLocalGame = () => {
     const initializedPlayers: Player[] = localSetupPlayers.map((p, idx) => ({
@@ -182,25 +106,40 @@ export function useGameController() {
     setWinner(null);
     setStatus('PLAYING');
     setLogs([
-      createLocalLog('Sistem', '#10B981', `Permainan dimulai dengan ${initializedPlayers.length} pemain! Tangga genap = Truth or Dare, Kepala Ular = Opsi Dare (Turun 1 angka)!`, 'MOVE'),
+      createLog('Sistem', '#10B981', `Permainan dimulai dengan ${initializedPlayers.length} pemain! Tangga genap = Truth or Dare, Kepala Ular = Opsi Dare (Turun 1 angka)!`, 'MOVE'),
     ]);
     soundFX.playStep();
   };
 
-  const handleCreateOnlineRoom = () => {
+  const handleCreateOnlineRoom = async () => {
     setOnlineError('');
-    sendOnlineAction({ type: 'room:create', playerName: onlinePlayerName.trim() || 'Pemain 1' });
+    if (!roomClientRef.current) return;
+    const room = await roomClientRef.current.createRoom(myPlayerId, onlinePlayerName.trim() || 'Pemain 1');
+    setGameMode('ONLINE');
+    setActiveRoomCode(room.roomId);
+    applyServerRoomState(room);
+    soundFX.playStep();
   };
 
-  const handleJoinOnlineRoom = (e: React.FormEvent) => {
+  const handleJoinOnlineRoom = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!roomCodeInput.trim()) return setOnlineError('Masukkan 5 karakter Kode Room terlebih dahulu.');
+    const cleanCode = roomCodeInput.trim().toUpperCase();
+    if (!cleanCode) return setOnlineError('Masukkan 5 karakter Kode Room terlebih dahulu.');
+    if (!roomClientRef.current) return;
     setOnlineError('');
-    sendOnlineAction({
-      type: 'room:join',
-      roomId: roomCodeInput.trim().toUpperCase(),
-      playerName: onlinePlayerName.trim() || 'Pemain Baru',
-    });
+    const result = await roomClientRef.current.joinRoom(
+      cleanCode,
+      myPlayerId,
+      onlinePlayerName.trim() || 'Pemain Baru'
+    );
+    if (!result.ok || !result.room) {
+      setOnlineError(result.message || 'Gagal bergabung ke room.');
+      return;
+    }
+    setGameMode('ONLINE');
+    setActiveRoomCode(result.room.roomId);
+    applyServerRoomState(result.room);
+    soundFX.playStep();
   };
 
   const pickRandomCardLocal = (type: TodType): TodCard => {
@@ -225,7 +164,7 @@ export function useGameController() {
     updatedPlayers[currentTurnIndex] = targetPlayer;
 
     const newLogs: GameLogEntry[] = [
-      createLocalLog(targetPlayer.name, targetPlayer.color, `Melempar dadu [${roll}] dan melangkah dari petak ${startPos} ke petak ${nextPos}.`, 'MOVE'),
+      createLog(targetPlayer.name, targetPlayer.color, `Melempar dadu [${roll}] dan melangkah dari petak ${startPos} ke petak ${nextPos}.`, 'MOVE'),
     ];
 
     const ladder = LADDERS.find((l) => l.start === nextPos);
@@ -242,7 +181,7 @@ export function useGameController() {
         const assignedMode = modes[Math.floor(Math.random() * modes.length)];
         const selectedType: TodType | null = assignedMode === 'RANDOM_TRUTH' ? 'TRUTH' : assignedMode === 'RANDOM_DARE' ? 'DARE' : null;
 
-        newLogs.unshift(createLocalLog(targetPlayer.name, targetPlayer.color, `Mendarat di Tangga Genap #${ladder.start} (menuju #${ladder.end})! Tantangan Truth or Dare dimulai!`, 'LADDER_EVEN'));
+        newLogs.unshift(createLog(targetPlayer.name, targetPlayer.color, `Mendarat di Tangga Genap #${ladder.start} (menuju #${ladder.end})! Tantangan Truth or Dare dimulai!`, 'LADDER_EVEN'));
         setPlayers(updatedPlayers);
         setLogs((prev) => [...newLogs, ...prev].slice(0, 40));
         setActiveTod({
@@ -260,7 +199,7 @@ export function useGameController() {
         return;
       } else {
         soundFX.playLadder(false);
-        newLogs.unshift(createLocalLog(targetPlayer.name, targetPlayer.color, `Naik Tangga Ganjil dari petak ${ladder.start} langsung ke petak ${ladder.end}!`, 'LADDER_ODD'));
+        newLogs.unshift(createLog(targetPlayer.name, targetPlayer.color, `Naik Tangga Ganjil dari petak ${ladder.start} langsung ke petak ${ladder.end}!`, 'LADDER_ODD'));
       }
     } else if (snake) {
       soundFX.playSnake();
@@ -269,7 +208,7 @@ export function useGameController() {
       setHighlightedTile(snake.start);
 
       newLogs.unshift(
-        createLocalLog(targetPlayer.name, targetPlayer.color, `Menginjak Kepala Ular di petak ${snake.start}! Pilih ambil tantangan DARE (turun 1 angka ke #${snake.start - 1}) atau meluncur ke ekor ular (#${snake.end})!`, 'SNAKE')
+        createLog(targetPlayer.name, targetPlayer.color, `Menginjak Kepala Ular di petak ${snake.start}! Pilih ambil tantangan DARE (turun 1 angka ke #${snake.start - 1}) atau meluncur ke ekor ular (#${snake.end})!`, 'SNAKE')
       );
       setPlayers(updatedPlayers);
       setLogs((prev) => [...newLogs, ...prev].slice(0, 40));
@@ -292,7 +231,7 @@ export function useGameController() {
     if (targetPlayer.position === 100) {
       soundFX.playVictory();
       fireVictoryConfetti();
-      newLogs.unshift(createLocalLog(targetPlayer.name, targetPlayer.color, `Mencapai petak 100 dan memenangkan pertandingan!`, 'WIN'));
+      newLogs.unshift(createLog(targetPlayer.name, targetPlayer.color, `Mencapai petak 100 dan memenangkan pertandingan!`, 'WIN'));
       setPlayers(updatedPlayers);
       setWinner(targetPlayer);
       setStatus('GAME_OVER');
@@ -318,11 +257,11 @@ export function useGameController() {
       if (ticks >= maxTicks) {
         clearInterval(interval);
         setIsRolling(false);
+        const finalRoll = Math.floor(Math.random() * 6) + 1;
+        setDiceValue(finalRoll);
         if (gameMode === 'ONLINE') {
-          sendOnlineAction({ type: 'game:roll' });
+          roomClientRef.current?.sendAction({ type: 'game:roll', roll: finalRoll });
         } else {
-          const finalRoll = Math.floor(Math.random() * 6) + 1;
-          setDiceValue(finalRoll);
           executeLocalPlayerMove(finalRoll);
         }
       }
@@ -331,18 +270,18 @@ export function useGameController() {
 
   const handleSelectTodType = (type: TodType) => {
     soundFX.playTodReveal();
-    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'tod:choose', todType: type });
+    if (gameMode === 'ONLINE') return void roomClientRef.current?.sendAction({ type: 'tod:choose', todType: type });
     if (activeTod) setActiveTod({ ...activeTod, selectedType: type, card: pickRandomCardLocal(type), phase: 'REVEALED' });
   };
 
   const handleRerollTodCard = () => {
     soundFX.playTodReveal();
-    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'tod:reroll_card' });
+    if (gameMode === 'ONLINE') return void roomClientRef.current?.sendAction({ type: 'tod:reroll_card' });
     if (activeTod?.selectedType) setActiveTod({ ...activeTod, card: pickRandomCardLocal(activeTod.selectedType) });
   };
 
   const handleResolveTod = (completed: boolean) => {
-    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'tod:resolve', completed });
+    if (gameMode === 'ONLINE') return void roomClientRef.current?.sendAction({ type: 'tod:resolve', completed });
     if (!activeTod) return;
 
     const isSnakeRescue = activeTod.triggerSource === 'SNAKE_HEAD';
@@ -383,7 +322,7 @@ export function useGameController() {
         ? `Sukses menyelesaikan ${activeTod.selectedType} di Tangga Genap #${activeTod.fromTile}! Bertahan di petak ${activeTod.toTile}.`
         : `Menyerah pada tantangan ${activeTod.selectedType}! Batal naik tangga dan kembali ke petak ${activeTod.fromTile}.`;
 
-      setLogs((prev) => [createLocalLog(activePlayer.name, activePlayer.color, logMsg, completed ? 'TOD_COMPLETE' : 'TOD_SKIP'), ...prev].slice(0, 40));
+      setLogs((prev) => [createLog(activePlayer.name, activePlayer.color, logMsg, completed ? 'TOD_COMPLETE' : 'TOD_SKIP'), ...prev].slice(0, 40));
     }
 
     setPlayers(updatedPlayers);
@@ -393,7 +332,7 @@ export function useGameController() {
   };
 
   const handleResetGame = () => {
-    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'game:reset' });
+    if (gameMode === 'ONLINE') return void roomClientRef.current?.sendAction({ type: 'game:reset' });
     setPlayers(players.map((p) => ({ ...p, position: 1, truthCount: 0, dareCount: 0, laddersClimbed: 0, snakesBitten: 0 })));
     setCurrentTurnIndex(0);
     setDiceValue(6);
@@ -401,11 +340,11 @@ export function useGameController() {
     setWinner(null);
     setHighlightedTile(1);
     setStatus('PLAYING');
-    setLogs([createLocalLog('Sistem', '#10B981', 'Permainan dimulai ulang! Semua pemain kembali ke petak 1.', 'MOVE')]);
+    setLogs([createLog('Sistem', '#10B981', 'Permainan dimulai ulang! Semua pemain kembali ke petak 1.', 'MOVE')]);
   };
 
   const handleAddCustomCard = (type: TodType, text: string) => {
-    if (gameMode === 'ONLINE' && activeRoomCode) return void sendOnlineAction({ type: 'card:add_custom', cardType: type, text });
+    if (gameMode === 'ONLINE' && activeRoomCode) return void roomClientRef.current?.sendAction({ type: 'card:add_custom', cardType: type, text });
     setCustomCards((prev) => [
       { id: `custom-${Date.now()}`, type, category: 'Seru', text, bonusText: 'Kartu Kustom Pemain — Selesaikan untuk bertahan di puncak tangga!' },
       ...prev,
