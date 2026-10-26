@@ -32,6 +32,7 @@ export function useGameController() {
   const [highlightedTile, setHighlightedTile] = useState<number | null>(null);
   const usedCardIdsRef = useRef<string[]>([]);
   const lastOnlineLogIdRef = useRef<string | null>(null);
+  const lastCelebratedWinnerRef = useRef<string | null>(null);
 
   const [myPlayerId] = useState(() => `player-${Math.random().toString(36).slice(2, 9)}`);
   const [onlinePlayerName, setOnlinePlayerName] = useState('Pemain 1');
@@ -40,29 +41,6 @@ export function useGameController() {
   const [onlineError, setOnlineError] = useState('');
   const [copiedRoom, setCopiedRoom] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
-
-  useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-    wsRef.current = ws;
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'room:error') setOnlineError(data.message);
-        if (data.type === 'room:joined') {
-          setOnlineError('');
-          setActiveRoomCode(data.roomId);
-          setGameMode('ONLINE');
-          applyServerRoomState(data.state);
-        }
-        if (data.type === 'room:state') applyServerRoomState(data.state);
-      } catch (e) {
-        console.error('WS parse error:', e);
-      }
-    };
-    return () => ws.close();
-  }, []);
 
   const applyServerRoomState = (room: RoomState) => {
     setStatus(room.status);
@@ -90,8 +68,97 @@ export function useGameController() {
     }
 
     if (room.status === 'GAME_OVER' && room.winner) {
-      soundFX.playVictory();
-      fireVictoryConfetti();
+      if (lastCelebratedWinnerRef.current !== room.winner.id) {
+        lastCelebratedWinnerRef.current = room.winner.id;
+        soundFX.playVictory();
+        fireVictoryConfetti();
+      }
+    } else {
+      lastCelebratedWinnerRef.current = null;
+    }
+  };
+
+  // Optional WebSocket connection + Auto-Reconnect
+  useEffect(() => {
+    let isMounted = true;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connectWs = () => {
+      if (!isMounted) return;
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        wsRef.current = ws;
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'room:error') setOnlineError(data.message);
+            if (data.type === 'room:joined') {
+              setOnlineError('');
+              setActiveRoomCode(data.roomId);
+              setGameMode('ONLINE');
+              applyServerRoomState(data.state);
+            }
+            if (data.type === 'room:state') applyServerRoomState(data.state);
+          } catch (e) {
+            console.error('WS parse error:', e);
+          }
+        };
+
+        ws.onclose = () => {
+          if (isMounted) reconnectTimer = setTimeout(connectWs, 2500);
+        };
+      } catch {
+        if (isMounted) reconnectTimer = setTimeout(connectWs, 3000);
+      }
+    };
+
+    connectWs();
+    return () => {
+      isMounted = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      wsRef.current?.close();
+    };
+  }, []);
+
+  // Reliable HTTP polling fallback when inside an active ONLINE room
+  useEffect(() => {
+    if (gameMode !== 'ONLINE' || !activeRoomCode || status === 'TITLE_MENU') return;
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/room/${activeRoomCode}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ok && data.state) applyServerRoomState(data.state);
+        }
+      } catch {
+        // Ignore transient network errors during poll
+      }
+    }, 1000);
+    return () => clearInterval(poll);
+  }, [gameMode, activeRoomCode, status]);
+
+  const sendOnlineAction = async (payload: Record<string, any>) => {
+    try {
+      const res = await fetch('/api/room', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, roomId: payload.roomId || activeRoomCode, playerId: myPlayerId }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setOnlineError(data.message || 'Gagal memproses permintaan room online.');
+        return;
+      }
+      setOnlineError('');
+      if (data.roomId) setActiveRoomCode(data.roomId);
+      if (data.state) {
+        setGameMode('ONLINE');
+        applyServerRoomState(data.state);
+      }
+    } catch {
+      setOnlineError('Gagal menghubungi server. Periksa koneksi internetmu.');
     }
   };
 
@@ -121,21 +188,19 @@ export function useGameController() {
   };
 
   const handleCreateOnlineRoom = () => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      return setOnlineError('Koneksi ke server sedang disiapkan, silakan coba sesaat lagi.');
-    }
     setOnlineError('');
-    wsRef.current.send(JSON.stringify({ type: 'room:create', playerId: myPlayerId, playerName: onlinePlayerName.trim() || 'Pemain 1' }));
+    sendOnlineAction({ type: 'room:create', playerName: onlinePlayerName.trim() || 'Pemain 1' });
   };
 
   const handleJoinOnlineRoom = (e: React.FormEvent) => {
     e.preventDefault();
     if (!roomCodeInput.trim()) return setOnlineError('Masukkan 5 karakter Kode Room terlebih dahulu.');
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return setOnlineError('Koneksi ke server belum aktif.');
     setOnlineError('');
-    wsRef.current.send(
-      JSON.stringify({ type: 'room:join', roomId: roomCodeInput.trim().toUpperCase(), playerId: myPlayerId, playerName: onlinePlayerName.trim() || 'Pemain Baru' })
-    );
+    sendOnlineAction({
+      type: 'room:join',
+      roomId: roomCodeInput.trim().toUpperCase(),
+      playerName: onlinePlayerName.trim() || 'Pemain Baru',
+    });
   };
 
   const pickRandomCardLocal = (type: TodType): TodCard => {
@@ -254,7 +319,7 @@ export function useGameController() {
         clearInterval(interval);
         setIsRolling(false);
         if (gameMode === 'ONLINE') {
-          wsRef.current?.send(JSON.stringify({ type: 'game:roll' }));
+          sendOnlineAction({ type: 'game:roll' });
         } else {
           const finalRoll = Math.floor(Math.random() * 6) + 1;
           setDiceValue(finalRoll);
@@ -266,18 +331,18 @@ export function useGameController() {
 
   const handleSelectTodType = (type: TodType) => {
     soundFX.playTodReveal();
-    if (gameMode === 'ONLINE') return wsRef.current?.send(JSON.stringify({ type: 'tod:choose', todType: type }));
+    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'tod:choose', todType: type });
     if (activeTod) setActiveTod({ ...activeTod, selectedType: type, card: pickRandomCardLocal(type), phase: 'REVEALED' });
   };
 
   const handleRerollTodCard = () => {
     soundFX.playTodReveal();
-    if (gameMode === 'ONLINE') return wsRef.current?.send(JSON.stringify({ type: 'tod:reroll_card' }));
+    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'tod:reroll_card' });
     if (activeTod?.selectedType) setActiveTod({ ...activeTod, card: pickRandomCardLocal(activeTod.selectedType) });
   };
 
   const handleResolveTod = (completed: boolean) => {
-    if (gameMode === 'ONLINE') return wsRef.current?.send(JSON.stringify({ type: 'tod:resolve', completed }));
+    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'tod:resolve', completed });
     if (!activeTod) return;
 
     const isSnakeRescue = activeTod.triggerSource === 'SNAKE_HEAD';
@@ -328,7 +393,7 @@ export function useGameController() {
   };
 
   const handleResetGame = () => {
-    if (gameMode === 'ONLINE') return wsRef.current?.send(JSON.stringify({ type: 'game:reset' }));
+    if (gameMode === 'ONLINE') return void sendOnlineAction({ type: 'game:reset' });
     setPlayers(players.map((p) => ({ ...p, position: 1, truthCount: 0, dareCount: 0, laddersClimbed: 0, snakesBitten: 0 })));
     setCurrentTurnIndex(0);
     setDiceValue(6);
@@ -340,7 +405,7 @@ export function useGameController() {
   };
 
   const handleAddCustomCard = (type: TodType, text: string) => {
-    if (gameMode === 'ONLINE' && activeRoomCode) return wsRef.current?.send(JSON.stringify({ type: 'card:add_custom', cardType: type, text }));
+    if (gameMode === 'ONLINE' && activeRoomCode) return void sendOnlineAction({ type: 'card:add_custom', cardType: type, text });
     setCustomCards((prev) => [
       { id: `custom-${Date.now()}`, type, category: 'Seru', text, bonusText: 'Kartu Kustom Pemain — Selesaikan untuk bertahan di puncak tangga!' },
       ...prev,
